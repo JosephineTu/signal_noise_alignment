@@ -1,0 +1,72 @@
+{
+  "cortexlab": {
+    "KS014": {
+      "n_VIS_sessions": 2,
+      "VIS_eids": [
+        "b9c205c3-feac-485b-a89d-afc96d9cb280",
+        "e1931de1-cf7b-49af-af33-2ade15e8abe7"
+      ],
+      "VIS_acronyms": [
+        "VISp1",
+        "VISp2/3",
+        "VISp4",
+        "VISp5",
+        "VISp6a",
+        "VISp6b"
+      ]
+    },
+    "KS023": {
+      "n_VIS_sessions": 1,
+      "VIS_eids": [
+        "aad23144-0e52-4eac-80c5-c4ee2decb198"
+      ],
+      "VIS_acronyms": [
+        "VISa2/3",
+        "VISa4",
+        "VISa5",
+        "VISa6a",
+        "VISa6b"
+      ]
+    },
+    "KS042": {
+      "n_VIS_sessions": 1,
+      "VIS_eids": [
+        "07dc4b76-5b93-4a03-82a0-b3d9cc73f412"
+      ],
+      "VIS_acronyms": [
+        "VISp2/3",
+        "VISp4",
+        "VISp5",
+        "VISp6a"
+      ]
+    },
+    "KS044": {
+      "n_VIS_sessions": 1,
+      "VIS_eids": [
+        "781b35fd-e1f0-4d14-b2bb-95b7263082bb"
+      ],
+      "VIS_acronyms": [
+        "VISa2/3",
+        "VISa4",
+        "VISa5",
+        "VISa6a",
+        "VISrl6a",
+        "VISrl6b"
+      ]
+    },
+    "KS046": {
+      "n_VIS_sessions": 1,
+      "VIS_eids": [
+        "aa3432cd-62bd-40bc-bc1c-a12d53bcbdcf"
+      ],
+      "VIS_acronyms": [
+        "VISp6a",
+        "VISp6b",
+        "VISpm2/3",
+        "VISpm4",
+        "VISpm5",
+        "VISpm6a"
+      ]
+    }
+  }
+}
