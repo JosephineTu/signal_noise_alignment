@@ -6,14 +6,15 @@ from passiveGabor_VIS import *
 from brainbox.population.decode import get_spike_counts_in_bins
 from pca_tool import *
 import matplotlib.pyplot as plt
-results = load_results('results.json')
+results = load_results('VIS_subjects_by_lab.json')
 ONE.setup(base_url='https://openalyx.internationalbrainlab.org', silent=True)
 one = ONE(password='international')
 eids = []
 for lab_name in results.keys():
     for subject in results[lab_name].keys():
-        subject_eid = results[lab_name][subject]['eids']
+        subject_eid = results[lab_name][subject]['VIS_eids']
         eids.extend(subject_eid)
+print(eids[0])
 # load firing rates of target region 
 def load_stim_firing_rates(eid, one=one, target_region = None):
     trials = one.load_object(eid, 'trials', collection='alf')
@@ -58,64 +59,78 @@ def get_signal_correlation(trials, fr_stim):
     cr = trials['contrastRight']
     cl = np.nan_to_num(cl, nan=0.0)
     cr = np.nan_to_num(cr, nan=0.0)
-
+    is_zero = (cl == 0) & (cr == 0)
     signed_contrast = cl - cr
-    conditions = np.unique(signed_contrast)
-    print(conditions)
-    for c in conditions:
-        print(c, np.sum(signed_contrast == c))
-    n_conditions = len(conditions)
+    nonzero_conds = np.unique(signed_contrast[~is_zero])
+    conditions = {
+        "non_zero": nonzero_conds,
+        "zero": 0.0
+    }
+    # for c in nonzero_conds:
+        # print(c, np.sum(signed_contrast == c) & (~is_zero))
+    # print("Zero contrast trials:", np.sum(is_zero))
+
+    n_conditions = len(nonzero_conds) + 1
     n_clusters = fr_stim.shape[1]
 
     fr_signal = np.zeros((n_conditions, n_clusters))
 
-    for i, cond in enumerate(conditions):
-        sel = (signed_contrast == cond)
+    for i, cond in enumerate(nonzero_conds):
+        sel = (signed_contrast == cond) & (~is_zero)
+        # define fr_signal as the mean fr across trials of the same condition
         fr_signal[i, :] = np.mean(fr_stim[sel, :], axis=0)
-        print(f"signal shape:{fr_signal.shape}")
+
+    fr_signal[-1, :] = np.mean(fr_stim[is_zero, :], axis=0)
     # compute signal correlation, shape (n_clusters, n_clusters)
     signal_corr = np.corrcoef(fr_signal.T)
-    return signal_corr, fr_signal
+    return signal_corr, fr_signal, conditions
 
-def get_noise_correlation(trials, fr_stim, fr_signal):
+def get_noise_correlation(trials, fr_stim, fr_signal, conditions):
     fr_noise = fr_stim.copy()
     cl = trials['contrastLeft']
     cr = trials['contrastRight']
     cl = np.nan_to_num(cl, nan=0.0)
     cr = np.nan_to_num(cr, nan=0.0)
-
+    is_zero = (cl == 0) & (cr == 0)
     signed_contrast = cl - cr
-    conditions = np.unique(signed_contrast)
+    nonzero_conds = conditions['non_zero']
 
-    for i, cond in enumerate(conditions):
-        sel = signed_contrast == cond
+    for i, cond in enumerate(nonzero_conds):
+        sel = (signed_contrast == cond) & (~is_zero)
         fr_noise[sel] -= fr_signal[i]
+    fr_noise[is_zero] -= fr_signal[-1]
+
     noise_corr = np.corrcoef(fr_noise, rowvar=False)
-    print(noise_corr.shape)
+    print("Noise correlation shape: ", noise_corr.shape)
     return noise_corr
 
-def condition_specific_noise_correlation(trials, fr_stim):
-    cl = trials['contrastLeft']
-    cr = trials['contrastRight']
-    cl = np.nan_to_num(cl, nan=0.0)
-    cr = np.nan_to_num(cr, nan=0.0)
-
+def condition_specific_noise_correlation(trials, fr_stim, conditions):
+    cl = np.nan_to_num(trials['contrastLeft'], nan=0.0)
+    cr = np.nan_to_num(trials['contrastRight'], nan=0.0)
     signed_contrast = cl - cr
-    conditions = np.unique(signed_contrast)
-    noise_corr_conds = []
+    is_zero = (cl == 0) & (cr == 0)
 
-    fr_signal_cond = np.zeros((len(conditions), fr_stim.shape[1]))
-    for i, c in enumerate (conditions):
-        sel = (signed_contrast == c)
+    noise_corr_conds = {}
+    fr_signal_cond = {}
+
+    for c in conditions['non_zero']:
+        sel = (signed_contrast == c) & (~is_zero)
         fr_cond = fr_stim[sel]
-        fr_signal_cond[i] = fr_cond.mean(axis=0)
-        fr_noise_cond = fr_cond - fr_cond.mean(axis=0, keepdims=True)
+        mu = fr_cond.mean(axis=0)
+        fr_noise = fr_cond - mu[None, :]
 
-        stds = np.std(fr_noise_cond, axis=0)
-        valid_clusters = stds > 0
-        fr_noise_cond = fr_noise_cond[:, valid_clusters]
-        noise_corr_cond = np.corrcoef(fr_noise_cond, rowvar=False)
-        noise_corr_conds.append(noise_corr_cond)
+        valid = np.std(fr_noise, axis=0) > 0
+        noise_corr_conds[c] = np.corrcoef(fr_noise[:, valid], rowvar=False)
+        fr_signal_cond[c] = mu
+
+    fr_zero = fr_stim[is_zero]
+    mu_0 = fr_zero.mean(axis=0)
+    fr_noise0 = fr_zero - mu_0[None, :]
+
+    valid = np.std(fr_noise0, axis=0) > 0
+    noise_corr_conds['zero'] = np.corrcoef(fr_noise0[:, valid], rowvar=False)
+    fr_signal_cond['zero'] = mu_0
+
     return noise_corr_conds, fr_signal_cond
 
 def compare_signal_noise_eig(signal_corr, noise_corr,
@@ -193,75 +208,111 @@ def get_projection_of_conditions(u_sig, fr_signal, conditions):
         mask = (conditions == c)
         proj.append(fr_signal[mask].mean(axis=0) @ u_sig)
     return np.array(proj)
-def condition_specific_noise_projection(fr_stim, trials, u_sig):
+
+def condition_specific_noise_projection(fr_stim, trials, u_sig, conditions):
     cl = np.nan_to_num(trials['contrastLeft'], nan=0.0)
     cr = np.nan_to_num(trials['contrastRight'], nan=0.0)
     signed_contrast = cl - cr
-    conditions = np.unique(signed_contrast)
+    is_zero = (cl == 0) & (cr == 0)
 
     proj_by_cond = {}
 
-    for c in conditions:
-        mask = (signed_contrast == c)
-        fr_cond = fr_stim[mask]
+    for c in conditions['non_zero']:
+        sel = (signed_contrast == c) & (~is_zero)
+        fr_cond = fr_stim[sel]
         fr_noise = fr_cond - fr_cond.mean(axis=0, keepdims=True)
-        proj = fr_noise @ u_sig
-        proj_by_cond[c] = proj
+        proj_by_cond[c] = fr_noise @ u_sig
+
+    fr_zero = fr_stim[is_zero]
+    fr_noise0 = fr_zero - fr_zero.mean(axis=0, keepdims=True)
+    proj_by_cond['zero'] = fr_noise0 @ u_sig
+
     return proj_by_cond
 
-def condition_noise_alignment_test(fr_stim, trials, u_sig, n_perm=500):
+def condition_noise_alignment_test(fr_stim, trials, u_sig, conditions, n_perm=500):
     cl = np.nan_to_num(trials['contrastLeft'], nan=0.0)
-    cr = np.nan_to_num (trials['contrastRight'], nan=0.0)
+    cr = np.nan_to_num(trials['contrastRight'], nan=0.0)
     signed_contrast = cl - cr
-    conditions = np.unique(signed_contrast)
+    is_zero = (cl == 0) & (cr == 0)
+
     z_alignment = {}
     pvals = {}
 
-    for c in conditions:
-        mask = (signed_contrast == c)
-        fr_cond = fr_stim[mask]
-        fr_noise = fr_cond - fr_cond.mean(axis=0, keepdims=True)
-
+    def compute(fr_noise):
         obs = np.mean(np.abs(fr_noise @ u_sig))
-
         null = np.zeros(n_perm)
         for i in range(n_perm):
             perm = np.random.permutation(fr_noise.shape[1])
-            null[i] = np.mean(np.abs(fr_noise[:,perm] @ u_sig))
-        z_alignment[c] = (obs - np.mean(null)) / np.std(null)
-        pvals[c] = (np.sum(null >= obs) + 1) / (n_perm + 1)
+            null[i] = np.mean(np.abs(fr_noise[:, perm] @ u_sig))
+        z = (obs - null.mean()) / null.std()
+        p = (np.sum(null >= obs) + 1) / (n_perm + 1)
+        return z, p
+
+    for c in conditions['non_zero']:
+        sel = (signed_contrast == c) & (~is_zero)
+        fr_cond = fr_stim[sel]
+        fr_noise = fr_cond - fr_cond.mean(axis=0, keepdims=True)
+        z_alignment[c], pvals[c] = compute(fr_noise)
+
+    fr_zero = fr_stim[is_zero]
+    fr_noise0 = fr_zero - fr_zero.mean(axis=0, keepdims=True)
+    z_alignment['zero'], pvals['zero'] = compute(fr_noise0)
+
     return z_alignment, pvals
 
-trials, fr_stim, region_cluster_ids = load_stim_firing_rates(eid, target_region='VISpor')
-print(fr_stim.shape) # (num_trials, num_clusters)
-signal_correlation, fr_signal = get_signal_correlation(trials, fr_stim)
+trials, fr_stim, region_cluster_ids = load_stim_firing_rates(
+    eids[0], target_region='VISp'
+)
+print(fr_stim.shape)
 
-noise_correlation = get_noise_correlation(trials, fr_stim, fr_signal)
+signal_correlation, fr_signal, conditions = get_signal_correlation(trials, fr_stim)
+print("fr_stim shape:", fr_stim.shape)
+print("Number of clusters:", fr_stim.shape[1])
+print("Number of trials:", fr_stim.shape[0])
 
-noise_correlation_conds, fr_signal_cond = condition_specific_noise_correlation(trials, fr_stim)
+noise_correlation = get_noise_correlation(trials, fr_stim, fr_signal, conditions)
 
-res = compare_signal_noise_eig(signal_correlation, noise_correlation, n_permutations=1000, shuffle_method='neuron_identities', fr_stim=fr_stim, trials=trials, verbose=True)
+noise_correlation_conds, fr_signal_cond = condition_specific_noise_correlation(trials, fr_stim, conditions)
+
+res = compare_signal_noise_eig(
+    signal_correlation,
+    noise_correlation,
+    n_permutations=1000,
+    shuffle_method='neuron_identities',
+    fr_stim=fr_stim,
+    trials=trials,
+    verbose=True
+)
 u_sig = res['usig']
 
 cl = np.nan_to_num(trials['contrastLeft'], nan=0.0)
 cr = np.nan_to_num(trials['contrastRight'], nan=0.0)
 signed_contrast = cl - cr
-conditions = np.unique(signed_contrast)
+is_zero = (cl == 0) & (cr == 0)
+
 trial_means = np.zeros_like(fr_stim)
-for i, c in enumerate(conditions):
-    mask = (signed_contrast == c)
-    trial_means[signed_contrast == c] = fr_signal_cond[i]
+
+for c in conditions['non_zero']:
+    sel = (signed_contrast == c) & (~is_zero)
+    trial_means[sel] = fr_signal_cond[c]
+
+trial_means[is_zero] = fr_signal_cond['zero']
+
 proj_noise = (fr_stim - trial_means) @ u_sig
 
 
 unique_conds = np.unique(signed_contrast)
 
-proj_by_cond = condition_specific_noise_projection(fr_stim, trials, u_sig)
+proj_by_cond = condition_specific_noise_projection(fr_stim, trials, u_sig, conditions)
 
 plt.figure(figsize=(8,4))
 
 for c, proj in proj_by_cond.items():
-    x = np.ones(len(proj)) * c
+    if c == 'zero':
+        c_num = 0.0  
+    else:
+        c_num = float(c)
+    x = np.ones(len(proj)) * c_num
     plt.scatter(x, proj, alpha=0.4, s=12)
 
 plt.axhline(0, color='k', lw=1)
@@ -271,7 +322,7 @@ plt.title("Condition-specific noise alignment with signal axis")
 plt.show()
 
 z_align, pvals = condition_noise_alignment_test(
-    fr_stim, trials, u_sig, n_perm=500
+    fr_stim, trials, u_sig, conditions, n_perm=500
 )
 
 plt.figure()
