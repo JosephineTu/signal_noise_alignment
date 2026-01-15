@@ -10,9 +10,10 @@ results = load_results('results.json')
 ONE.setup(base_url='https://openalyx.internationalbrainlab.org', silent=True)
 one = ONE(password='international')
 eids = []
-for r in results:
-    eids.append(r['eid'])
-eid = eids[0]
+for lab_name in results.keys():
+    for subject in results[lab_name].keys():
+        subject_eid = results[lab_name][subject]['eids']
+        eids.extend(subject_eid)
 # load firing rates of target region 
 def load_stim_firing_rates(eid, one=one, target_region = None):
     trials = one.load_object(eid, 'trials', collection='alf')
@@ -38,7 +39,7 @@ def load_stim_firing_rates(eid, one=one, target_region = None):
 
     counts, cluster_ids = get_spike_counts_in_bins(spikes['times'], spikes['clusters'], stim_intervals)
     counts = counts.T
-    # filter clusters by target region
+    # filter clusters by target region prefix
     if target_region is not None:
         region_mask = np.array([a.startswith(target_region) for a in clusters['acronym']])
         region_cluster_ids = clusters['cluster_id'][region_mask]
