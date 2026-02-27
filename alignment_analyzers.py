@@ -49,7 +49,7 @@ class IBLAlignmentBase:
         """
         C = np.asarray(C, dtype=float)
         return 0.5 * (C + C.T)
-
+    
     def trace_normalize(self, C):
         """
         Normalize C by its trace, with safety for near-zero trace.
@@ -59,7 +59,7 @@ class IBLAlignmentBase:
         if tr < self.cfg.eps:
             return C
         return C / tr
-
+    
     def top_eigenvector(self, C, return_eigval=False):
         """
         Compute the top eigenvector of C, 
@@ -239,10 +239,23 @@ class IBLAlignmentBase:
         """
         Compute noise correlation matrix from residuals of high-contrast trials.
         """
-        X = fr_noise[high_mask]
+        X = fr_noise[high_mask]                      # (n_high, n_units)
+        if X.shape[0] < 3:
+            raise RuntimeError("Too few trials to compute correlation.")
+
+        # drop neurons with (near) zero std in this bin
+        std = np.nanstd(X, axis=0)
+        keep = std > self.cfg.std_eps
+        if keep.sum() < 3:
+            raise RuntimeError("Too few varying units to compute correlation.")
+
+        X = X[:, keep]
         C = np.corrcoef(X, rowvar=False)
+
+        # just in case any numerical NaNs remain
         C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
-        return self.enforce_sym(C)
+        C = 0.5 * (C + C.T)
+        return C, keep
 
     @staticmethod
     def stratified_kfold_indices(y, k=5, seed=0):
@@ -301,8 +314,37 @@ class IBLAlignmentBase:
             score = (proj[test_idx] - 0.5 * (m1 + m0)) * np.sign(m1 - m0 + self.cfg.eps)
             aucs.append(self.roc_auc_approx(y[test_idx], score))
         return float(np.nanmean(aucs))
+    
+    def cv_decode_2d_lda(self, X, y, k=5, seed=42):
+        X = np.asarray(X,float)
+        y = np.asarray(y,float)
+        if X.ndim != 2 or X.shape[1] != 2:
+            raise ValueError(f"X must be (n_trials, 2), got {X.shape}")
+        folds = self.stratified_kfold_indices(y, k=k, seed=seed)
+        aucs = []
+        for test_idx in folds:
+            train_idx = np.setdiff1d(np.arange(len(y)), test_idx)
+            
+            X_train, y_train = X[train_idx], y[train_idx]
+            X_test, y_test = X[test_idx], y[test_idx]
 
+            mu_1 = X_train[y_train == 1].mean(axis=0)
+            mu_0 = X_train[y_train == -1].mean(axis=0)
 
+            C = np.cov(X_train.T, bias=False)
+            if C.ndim == 0:
+                C = np.array([[float(C)]])
+            if C.shape != (2, 2):
+                C = np.eye(2) * self.cfg.eps
+            
+            C += self.cfg.eps * np.eye(2)
+            w = np.linalg.solve(C, mu_1 - mu_0)
+            b = 0.5 * (mu_1 + mu_0) @ w
+            score = (X_test @ w) - b
+            aucs.append(self.roc_auc_approx(y_test, score))
+
+        return float(np.nanmean(aucs))
+    
 class StaticAlignmentAnalyzer(IBLAlignmentBase):
     """
     - Bin spikes over stimOn->stimOff (one value per trial)
@@ -348,13 +390,21 @@ class StaticAlignmentAnalyzer(IBLAlignmentBase):
         fr = fr[:, neuron_mask]
 
         u_sig, mu_pos, mu_neg, sig_norm = self.compute_signal_axis_mu(fr, pos_mask, neg_mask)
+        print(f"u_sig shape: {u_sig.shape}")
         fr_noise = self.noise_residuals_by_sign(fr, pos_mask, neg_mask, mu_pos, mu_neg)
 
-        C_noi = self.noise_corr_from_residuals(fr_noise, high_mask)
-        C_noi_norm = self.trace_normalize(C_noi)
-        u_noi, ev_noi = self.top_eigenvector(C_noi_norm, return_eigval=True)
+        C_noi, keep_bin = self.noise_corr_from_residuals(fr_noise, high_mask)
+        fr_k = fr[:,keep_bin]
+        fr_noise_k = fr_noise[:,keep_bin]
+        if keep_bin.sum() < self.cfg.min_units:
+            raise RuntimeError("Too few varying units for noise corr in this session.")
+        u_sig_k = u_sig[keep_bin]
+        u_sig_k = u_sig_k / (np.linalg.norm(u_sig_k) + self.cfg.eps)
 
-        cos = self.cosine_abs(u_sig, u_noi, eps=self.cfg.eps)
+        C_noi_norm = self.trace_normalize(C_noi)
+        u_noi_k, ev_noi = self.top_eigenvector(C_noi_norm, return_eigval=True)
+
+        cos = self.cosine_abs(u_sig_k, u_noi_k)
 
         vals, cum = self.eig_spectrum(C_noi, do_trace_norm=True)
         D_eff = self.participation_ratio(vals)
@@ -471,6 +521,7 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
 
     def run_one_eid(self, eid: str, do_plots=True) -> Dict[str, Any]:
         trials, spikes, clusters, pid, region_cluster_ids, stim_on, stim_off = self.load_trials_and_spikes(eid)
+        t_choice = trials["firstMovement_times"] - stim_on
         signed, is_zero, high_mask, pos_mask, neg_mask = self.get_signed_and_masks(trials)
         choice, feedback, pleft = self.get_choice_feedback(trials)
 
@@ -496,10 +547,15 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
         noise_top1_ts = np.full(n_bins, np.nan)
         noise_pr_ts = np.full(n_bins, np.nan)
         sig_norm_ts = np.full(n_bins, np.nan)
+        
+        stim_auc_1d_ts = np.full(n_bins, np.nan)
+        stim_auc_2d_ts = np.full(n_bins, np.nan)
 
-        stim_auc_ts = np.full(n_bins, np.nan)
-        choice_auc_ts = np.full(n_bins, np.nan)
-        fb_auc_ts = np.full(n_bins, np.nan)
+        choice_auc_1d_ts = np.full(n_bins, np.nan)
+        choice_auc_2d_ts = np.full(n_bins, np.nan)
+
+        fb_auc_1d_ts = np.full(n_bins, np.nan)
+        fb_auc_2d_ts = np.full(n_bins, np.nan)
 
         choice_valid = choice != 0
 
@@ -516,13 +572,19 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             fr_noise = self.noise_residuals_by_sign(fr_bin, pos_mask, neg_mask, mu_pos, mu_neg)
 
             try:
-                C_noi = self.noise_corr_from_residuals(fr_noise, high_mask)
-                C_noi_norm = self.trace_normalize(C_noi)
-                u_noi, _ = self.top_eigenvector(C_noi_norm, return_eigval=True)
+                C_noi, keep_bin = self.noise_corr_from_residuals(fr_noise, high_mask)
+
+                X_k = fr_bin[:, keep_bin]
+                N_k = fr_noise[:, keep_bin]
+
+                usig_k = u_sig[keep_bin]
+                usig_k = usig_k / (np.linalg.norm(usig_k) + self.cfg.eps)
+
+                unoi_k, _ = self.top_eigenvector(self.trace_normalize(C_noi), return_eigval=True)
             except Exception:
                 continue
 
-            cos_ts[b] = self.cosine_abs(u_sig, u_noi, eps=self.cfg.eps)
+            cos_ts[b] = self.cosine_abs(usig_k, unoi_k, eps=self.cfg.eps)
             vals, _ = self.eig_spectrum(C_noi, do_trace_norm=True)
             noise_top1_ts[b] = float(vals[0]) if len(vals) else np.nan
             noise_pr_ts[b] = self.participation_ratio(vals)
@@ -532,23 +594,32 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
                 # stimulus
                 use = high_mask & (signed != 0)
                 if use.sum() >= 2 * self.cfg.min_trials:
-                    proj = fr_bin[use] @ u_sig
+                    proj_sig = X_k[use] @ usig_k
                     y = np.where(signed[use] > 0, 1, -1)
-                    stim_auc_ts[b] = self.cv_decode_1d(proj, y, k=5, seed=0)
-
+                    stim_auc_1d_ts[b] = self.cv_decode_1d(proj_sig, y, k=5, seed=0)
+                    
+                    proj_noi = X_k[use] @ unoi_k
+                    X2 = np.c_[proj_sig, proj_noi]
+                    stim_auc_2d_ts[b] = self.cv_decode_2d_lda(X2, y, k=5, seed=0)
                 # choice
                 usec = high_mask & choice_valid
                 if usec.sum() >= 2 * self.cfg.min_trials:
                     y = np.where(choice[usec] > 0, 1, -1)
-                    proj = fr_bin[usec] @ u_sig
-                    choice_auc_ts[b] = self.cv_decode_1d(proj, y, k=5, seed=1)
+                    proj_sig = X_k[usec] @ usig_k
+                    choice_auc_1d_ts[b] = self.cv_decode_1d(proj_sig, y, k=5, seed=1)
+                    proj_noi = X_k[usec] @ unoi_k
+                    X2 = np.c_[proj_sig, proj_noi]
+                    choice_auc_2d_ts[b] = self.cv_decode_2d_lda(X2, y, k=5, seed=1)
 
                 # feedback (correct/error) using residual projection
                 usef = high_mask & (feedback != 0)
                 if usef.sum() >= 2 * self.cfg.min_trials:
                     y = np.where(feedback[usef] > 0, 1, -1)
-                    proj = fr_noise[usef] @ u_sig
-                    fb_auc_ts[b] = self.cv_decode_1d(proj, y, k=5, seed=2)
+                    proj_sig = N_k[usef] @ usig_k
+                    fb_auc_1d_ts[b] = self.cv_decode_1d(proj_sig, y, k=5, seed=2)
+                    proj_noi = N_k[usef] @ unoi_k
+                    X2 = np.c_[proj_sig, proj_noi]
+                    fb_auc_2d_ts[b] = self.cv_decode_2d_lda(X2, y, k=5, seed=2)
 
         if do_plots:
             plt.figure(figsize=(7, 4))
@@ -576,9 +647,9 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
 
             if self.do_decode:
                 plt.figure(figsize=(7, 4))
-                plt.plot(times, stim_auc_ts, marker="o", label="stimulus AUC (proj)")
-                plt.plot(times, choice_auc_ts, marker="o", label="choice AUC (proj)")
-                plt.plot(times, fb_auc_ts, marker="o", label="feedback AUC (resid proj)")
+                plt.plot(times, stim_auc_1d_ts, marker="o", label="stimulus AUC (proj)")
+                plt.plot(times, choice_auc_1d_ts, marker="o", label="choice AUC (proj)")
+                plt.plot(times, fb_auc_1d_ts, marker="o", label="feedback AUC (resid proj)")
                 plt.axhline(0.5, color="k", lw=1)
                 plt.ylim(0.0, 1.0)
                 plt.xlabel("time from stimOn (s)")
@@ -586,6 +657,24 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
                 plt.title("Time-resolved decoding (CV, 1D)")
                 plt.legend(frameon=False)
                 plt.tight_layout()
+                tc = trials["firstMovement_times"] - trials["stimOn_times"]
+                tc = tc[np.isfinite(tc)]
+                plt.axvline(np.median(tc), linestyle="--")
+                plt.show()
+                plt.figure(figsize=(7, 4))
+                plt.plot(times, stim_auc_2d_ts, marker="o", label="stimulus AUC (proj)")
+                plt.plot(times, choice_auc_2d_ts, marker="o", label="choice AUC (proj)")
+                plt.plot(times, fb_auc_2d_ts, marker="o", label="feedback AUC (resid proj)")
+                plt.axhline(0.5, color="k", lw=1)
+                plt.ylim(0.0, 1.0)
+                plt.xlabel("time from stimOn (s)")
+                plt.ylabel("AUC")
+                plt.title("Time-resolved decoding (CV, 1D)")
+                plt.legend(frameon=False)
+                plt.tight_layout()
+                tc = trials["firstMovement_times"] - trials["stimOn_times"]
+                tc = tc[np.isfinite(tc)]
+                plt.axvline(np.median(tc), linestyle="--")
                 plt.show()
 
         return {
@@ -598,9 +687,9 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             "noise_top1_ts": noise_top1_ts,
             "noise_pr_ts": noise_pr_ts,
             "sig_norm_ts": sig_norm_ts,
-            "stim_auc_ts": stim_auc_ts,
-            "choice_auc_ts": choice_auc_ts,
-            "fb_auc_ts": fb_auc_ts,
+            "stim_auc_ts": stim_auc_1d_ts,
+            "choice_auc_ts": choice_auc_1d_ts,
+            "fb_auc_ts": fb_auc_1d_ts,
         }
 
 def build_eids_from_results(json_path="VISp_subjects_by_lab.json") -> List[str]:
