@@ -20,6 +20,9 @@ class AnalyzerConfig:
     eps: float = 1e-12
     min_units: int = 5
     std_eps: float = 1e-10
+    cv_folds: int = 5
+    residualize_behavioral_nuisance: bool = True
+    verbose: bool = True
 
 
 class IBLAlignmentBase:
@@ -132,6 +135,7 @@ class IBLAlignmentBase:
         """
         ins = self.one.alyx.rest("insertions", "list", session=eid)
         best_pid, best_n = None, -1
+        errors = []
         for x in ins:
             pid = x["id"]
             try:
@@ -146,10 +150,14 @@ class IBLAlignmentBase:
                 if n > best_n:
                     best_n = n
                     best_pid = pid
-            except Exception:
+            except Exception as exc:
+                errors.append((pid, repr(exc)))
                 continue
         if best_pid is None:
-            raise RuntimeError("No valid insertion found.")
+            msg = f"No valid insertion found for eid={eid}."
+            if errors:
+                msg += f" Example loader errors: {errors[:3]}"
+            raise RuntimeError(msg)
         return best_pid
 
     def load_trials_and_spikes(self, eid: str):
@@ -235,27 +243,33 @@ class IBLAlignmentBase:
         fr_noise[neg_mask] = fr_bin[neg_mask] - mu_neg
         return fr_noise
 
-    def noise_corr_from_residuals(self, fr_noise, high_mask):
+    def noise_cov_from_residuals(self, fr_noise, high_mask):
         """
-        Compute noise correlation matrix from residuals of high-contrast trials.
+        Compute noise covariance matrix from residuals of high-contrast trials.
         """
         X = fr_noise[high_mask]                      # (n_high, n_units)
         if X.shape[0] < 3:
-            raise RuntimeError("Too few trials to compute correlation.")
+            raise RuntimeError("Too few trials to compute covariance.")
 
         # drop neurons with (near) zero std in this bin
         std = np.nanstd(X, axis=0)
         keep = std > self.cfg.std_eps
         if keep.sum() < 3:
-            raise RuntimeError("Too few varying units to compute correlation.")
+            raise RuntimeError("Too few varying units to compute covariance.")
 
         X = X[:, keep]
-        C = np.corrcoef(X, rowvar=False)
+        C = np.cov(X, rowvar=False)
 
         # just in case any numerical NaNs remain
         C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
         C = 0.5 * (C + C.T)
         return C, keep
+
+    def noise_corr_from_residuals(self, fr_noise, high_mask):
+        """
+        Backward-compatible alias for callers that still expect the old name.
+        """
+        return self.noise_cov_from_residuals(fr_noise, high_mask)
 
     @staticmethod
     def stratified_kfold_indices(y, k=5, seed=0):
@@ -274,6 +288,15 @@ class IBLAlignmentBase:
             for i in range(k):
                 folds[i].extend(parts[i].tolist())
         return [np.array(sorted(f), dtype=int) for f in folds]
+
+    def choose_kfold(self, y, requested_k=None):
+        y = np.asarray(y)
+        cls, counts = np.unique(y, return_counts=True)
+        if len(cls) < 2:
+            return 0
+        max_k = int(np.min(counts))
+        req = self.cfg.cv_folds if requested_k is None else int(requested_k)
+        return max(0, min(req, max_k))
 
     @staticmethod
     def roc_auc_approx(y_true, score):
@@ -305,6 +328,9 @@ class IBLAlignmentBase:
         """
         proj = np.asarray(proj, float)
         y = np.asarray(y, float)
+        k = self.choose_kfold(y, requested_k=k)
+        if k < 2:
+            return np.nan
         folds = self.stratified_kfold_indices(y, k=k, seed=seed)
         aucs = []
         for test_idx in folds:
@@ -320,6 +346,9 @@ class IBLAlignmentBase:
         y = np.asarray(y,float)
         if X.ndim != 2 or X.shape[1] != 2:
             raise ValueError(f"X must be (n_trials, 2), got {X.shape}")
+        k = self.choose_kfold(y, requested_k=k)
+        if k < 2:
+            return np.nan
         folds = self.stratified_kfold_indices(y, k=k, seed=seed)
         aucs = []
         for test_idx in folds:
@@ -344,6 +373,109 @@ class IBLAlignmentBase:
             aucs.append(self.roc_auc_approx(y_test, score))
 
         return float(np.nanmean(aucs))
+
+    def make_nuisance_design(self, signed, pleft=None, t_choice=None):
+        signed = np.asarray(signed, float)
+        cols = [
+            np.ones_like(signed),
+            signed,
+            np.abs(signed),
+        ]
+        if pleft is not None:
+            cols.append(np.asarray(pleft, float))
+        if t_choice is not None:
+            tc = np.asarray(t_choice, float)
+            tc = np.where(np.isfinite(tc), tc, np.nanmedian(tc[np.isfinite(tc)]) if np.isfinite(tc).any() else 0.0)
+            cols.append(tc)
+        return np.column_stack(cols)
+
+    def residualize_features(self, X_train, X_test, Z_train, Z_test):
+        beta, _, _, _ = np.linalg.lstsq(Z_train, X_train, rcond=None)
+        return X_train - Z_train @ beta, X_test - Z_test @ beta
+
+    def decode_bin_foldwise(
+        self,
+        fr_bin,
+        signed,
+        high_mask,
+        pos_mask,
+        neg_mask,
+        y,
+        use_mask,
+        seed,
+        residual_source="raw",
+        nuisance_Z=None,
+    ):
+        y = np.asarray(y, float)
+        use_mask = np.asarray(use_mask, bool)
+        idx_all = np.flatnonzero(use_mask)
+        if idx_all.size == 0:
+            return {"auc_1d": np.nan, "auc_2d": np.nan}
+
+        y_use = y[idx_all]
+        k = self.choose_kfold(y_use)
+        if k < 2 or idx_all.size < 2 * self.cfg.min_trials:
+            return {"auc_1d": np.nan, "auc_2d": np.nan}
+
+        folds_local = self.stratified_kfold_indices(y_use, k=k, seed=seed)
+        auc_1d, auc_2d = [], []
+
+        for fold in folds_local:
+            test_idx = idx_all[fold]
+            train_idx = np.setdiff1d(idx_all, test_idx)
+
+            train_pos = np.isin(np.arange(fr_bin.shape[0]), train_idx) & pos_mask
+            train_neg = np.isin(np.arange(fr_bin.shape[0]), train_idx) & neg_mask
+            train_high = np.isin(np.arange(fr_bin.shape[0]), train_idx) & high_mask
+
+            try:
+                u_sig, mu_pos, mu_neg, _ = self.compute_signal_axis_mu(fr_bin, train_pos, train_neg)
+                fr_noise = self.noise_residuals_by_sign(fr_bin, pos_mask, neg_mask, mu_pos, mu_neg)
+                C_noi, keep_bin = self.noise_cov_from_residuals(fr_noise, train_high)
+            except Exception:
+                continue
+
+            if keep_bin.sum() < self.cfg.min_units:
+                continue
+
+            X_use = fr_bin[:, keep_bin]
+            N_use = fr_noise[:, keep_bin]
+            u_sig_k = u_sig[keep_bin]
+            u_sig_k = u_sig_k / (np.linalg.norm(u_sig_k) + self.cfg.eps)
+            u_noi_k, _ = self.top_eigenvector(self.trace_normalize(C_noi), return_eigval=True)
+
+            source = X_use if residual_source == "raw" else N_use
+            X_train = np.c_[source[train_idx] @ u_sig_k, source[train_idx] @ u_noi_k]
+            X_test = np.c_[source[test_idx] @ u_sig_k, source[test_idx] @ u_noi_k]
+
+            if nuisance_Z is not None and self.cfg.residualize_behavioral_nuisance:
+                Z_train = nuisance_Z[train_idx]
+                Z_test = nuisance_Z[test_idx]
+                X_train, X_test = self.residualize_features(X_train, X_test, Z_train, Z_test)
+
+            y_train = y[train_idx]
+            y_test = y[test_idx]
+
+            mu_1 = X_train[y_train == 1].mean(axis=0)
+            mu_0 = X_train[y_train == -1].mean(axis=0)
+            C_lda = np.cov(X_train.T, bias=False)
+            if C_lda.ndim == 0:
+                C_lda = np.array([[float(C_lda)]])
+            if C_lda.shape != (2, 2):
+                C_lda = np.eye(2) * self.cfg.eps
+            C_lda += self.cfg.eps * np.eye(2)
+            w = np.linalg.solve(C_lda, mu_1 - mu_0)
+            b = 0.5 * (mu_1 + mu_0) @ w
+            score_1d = (X_test[:, 0] - 0.5 * (X_train[y_train == 1, 0].mean() + X_train[y_train == -1, 0].mean()))
+            score_1d *= np.sign(X_train[y_train == 1, 0].mean() - X_train[y_train == -1, 0].mean() + self.cfg.eps)
+            score_2d = X_test @ w - b
+            auc_1d.append(self.roc_auc_approx(y_test, score_1d))
+            auc_2d.append(self.roc_auc_approx(y_test, score_2d))
+
+        return {
+            "auc_1d": float(np.nanmean(auc_1d)) if auc_1d else np.nan,
+            "auc_2d": float(np.nanmean(auc_2d)) if auc_2d else np.nan,
+        }
     
 class StaticAlignmentAnalyzer(IBLAlignmentBase):
     """
@@ -390,15 +522,13 @@ class StaticAlignmentAnalyzer(IBLAlignmentBase):
         fr = fr[:, neuron_mask]
 
         u_sig, mu_pos, mu_neg, sig_norm = self.compute_signal_axis_mu(fr, pos_mask, neg_mask)
-        print(f"u_sig shape: {u_sig.shape}")
         fr_noise = self.noise_residuals_by_sign(fr, pos_mask, neg_mask, mu_pos, mu_neg)
 
-        C_noi, keep_bin = self.noise_corr_from_residuals(fr_noise, high_mask)
-        fr_k = fr[:,keep_bin]
-        fr_noise_k = fr_noise[:,keep_bin]
+        C_noi, keep_bin = self.noise_cov_from_residuals(fr_noise, high_mask)
         if keep_bin.sum() < self.cfg.min_units:
-            raise RuntimeError("Too few varying units for noise corr in this session.")
+            raise RuntimeError("Too few varying units for noise covariance in this session.")
         u_sig_k = u_sig[keep_bin]
+        
         u_sig_k = u_sig_k / (np.linalg.norm(u_sig_k) + self.cfg.eps)
 
         C_noi_norm = self.trace_normalize(C_noi)
@@ -411,9 +541,9 @@ class StaticAlignmentAnalyzer(IBLAlignmentBase):
 
         if do_plots:
             plt.figure(figsize=(5, 4))
-            plt.imshow(C_noi, vmin=-1, vmax=1, cmap="coolwarm")
-            plt.colorbar(label="corr")
-            plt.title("Noise correlation (static)")
+            plt.imshow(C_noi, cmap="coolwarm")
+            plt.colorbar(label="covariance")
+            plt.title("Noise covariance (static)")
             plt.tight_layout()
             plt.show()
 
@@ -436,6 +566,9 @@ class StaticAlignmentAnalyzer(IBLAlignmentBase):
             "noise_top5_cum": float(cum[min(4, len(cum)-1)]) if len(cum) else np.nan,
             "noise_PR": float(D_eff),
             "noise_top_eig": float(ev_noi),
+            "n_pos_high": int(pos_mask.sum()),
+            "n_neg_high": int(neg_mask.sum()),
+            "n_units_cov": int(keep_bin.sum()),
         }
 
     def run_many(self, eids: List[str], do_plots=False):
@@ -452,7 +585,7 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
     """
     Equivalent of your time_resolved_alignment.py:
     - Build fr_tb: (n_trials, n_bins, n_units)
-    - For each bin, compute u_sig(t), noise corr, u_noi(t), alignment(t)
+    - For each bin, compute u_sig(t), noise covariance, u_noi(t), alignment(t)
     - Optionally run 1D decoding timecourses
     """
 
@@ -524,10 +657,10 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
         t_choice = trials["firstMovement_times"] - stim_on
         signed, is_zero, high_mask, pos_mask, neg_mask = self.get_signed_and_masks(trials)
         choice, feedback, pleft = self.get_choice_feedback(trials)
+        nuisance_Z = self.make_nuisance_design(signed, pleft=pleft, t_choice=t_choice)
 
         edges = self.make_time_bins(self.t_start, self.t_end, self.bin_size)
         fr_tb, unit_ids = self.trial_binned_firing_rates(spikes, region_cluster_ids, stim_on, edges)
-        print_feedback_summary(trials)
         n_trials, n_bins, n_units = fr_tb.shape
         if n_units < self.cfg.min_units:
             raise RuntimeError(f"Too few units after region filter: {n_units}")
@@ -558,13 +691,16 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
         fb_auc_2d_ts = np.full(n_bins, np.nan)
 
         choice_valid = choice != 0
+        fb_valid = feedback != 0
+        bin_status = []
 
         for b in range(n_bins):
             fr_bin = fr_tb[:, b, :]  # (trial, unit)
 
             try:
                 u_sig, mu_pos, mu_neg, sig_norm = self.compute_signal_axis_mu(fr_bin, pos_mask, neg_mask)
-            except Exception:
+            except Exception as exc:
+                bin_status.append({"bin": int(b), "status": "signal_failed", "reason": repr(exc)})
                 continue
 
             sig_norm_ts[b] = sig_norm
@@ -572,54 +708,67 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             fr_noise = self.noise_residuals_by_sign(fr_bin, pos_mask, neg_mask, mu_pos, mu_neg)
 
             try:
-                C_noi, keep_bin = self.noise_corr_from_residuals(fr_noise, high_mask)
-
-                X_k = fr_bin[:, keep_bin]
-                N_k = fr_noise[:, keep_bin]
+                C_noi, keep_bin = self.noise_cov_from_residuals(fr_noise, high_mask)
 
                 usig_k = u_sig[keep_bin]
                 usig_k = usig_k / (np.linalg.norm(usig_k) + self.cfg.eps)
 
                 unoi_k, _ = self.top_eigenvector(self.trace_normalize(C_noi), return_eigval=True)
-            except Exception:
+            except Exception as exc:
+                bin_status.append({"bin": int(b), "status": "noise_failed", "reason": repr(exc)})
                 continue
 
             cos_ts[b] = self.cosine_abs(usig_k, unoi_k, eps=self.cfg.eps)
             vals, _ = self.eig_spectrum(C_noi, do_trace_norm=True)
             noise_top1_ts[b] = float(vals[0]) if len(vals) else np.nan
             noise_pr_ts[b] = self.participation_ratio(vals)
-            # store sig strength too (already)
+            bin_status.append({"bin": int(b), "status": "ok", "n_units_cov": int(keep_bin.sum())})
 
             if self.do_decode:
-                # stimulus
-                use = high_mask & (signed != 0)
-                if use.sum() >= 2 * self.cfg.min_trials:
-                    proj_sig = X_k[use] @ usig_k
-                    y = np.where(signed[use] > 0, 1, -1)
-                    stim_auc_1d_ts[b] = self.cv_decode_1d(proj_sig, y, k=5, seed=0)
-                    
-                    proj_noi = X_k[use] @ unoi_k
-                    X2 = np.c_[proj_sig, proj_noi]
-                    stim_auc_2d_ts[b] = self.cv_decode_2d_lda(X2, y, k=5, seed=0)
-                # choice
-                usec = high_mask & choice_valid
-                if usec.sum() >= 2 * self.cfg.min_trials:
-                    y = np.where(choice[usec] > 0, 1, -1)
-                    proj_sig = X_k[usec] @ usig_k
-                    choice_auc_1d_ts[b] = self.cv_decode_1d(proj_sig, y, k=5, seed=1)
-                    proj_noi = X_k[usec] @ unoi_k
-                    X2 = np.c_[proj_sig, proj_noi]
-                    choice_auc_2d_ts[b] = self.cv_decode_2d_lda(X2, y, k=5, seed=1)
+                stim_out = self.decode_bin_foldwise(
+                    fr_bin=fr_bin,
+                    signed=signed,
+                    high_mask=high_mask,
+                    pos_mask=pos_mask,
+                    neg_mask=neg_mask,
+                    y=np.where(signed > 0, 1, -1),
+                    use_mask=high_mask & (signed != 0),
+                    seed=0,
+                    residual_source="raw",
+                    nuisance_Z=None,
+                )
+                stim_auc_1d_ts[b] = stim_out["auc_1d"]
+                stim_auc_2d_ts[b] = stim_out["auc_2d"]
 
-                # feedback (correct/error) using residual projection
-                usef = high_mask & (feedback != 0)
-                if usef.sum() >= 2 * self.cfg.min_trials:
-                    y = np.where(feedback[usef] > 0, 1, -1)
-                    proj_sig = N_k[usef] @ usig_k
-                    fb_auc_1d_ts[b] = self.cv_decode_1d(proj_sig, y, k=5, seed=2)
-                    proj_noi = N_k[usef] @ unoi_k
-                    X2 = np.c_[proj_sig, proj_noi]
-                    fb_auc_2d_ts[b] = self.cv_decode_2d_lda(X2, y, k=5, seed=2)
+                choice_out = self.decode_bin_foldwise(
+                    fr_bin=fr_bin,
+                    signed=signed,
+                    high_mask=high_mask,
+                    pos_mask=pos_mask,
+                    neg_mask=neg_mask,
+                    y=np.where(choice > 0, 1, -1),
+                    use_mask=high_mask & choice_valid,
+                    seed=1,
+                    residual_source="raw",
+                    nuisance_Z=nuisance_Z,
+                )
+                choice_auc_1d_ts[b] = choice_out["auc_1d"]
+                choice_auc_2d_ts[b] = choice_out["auc_2d"]
+
+                fb_out = self.decode_bin_foldwise(
+                    fr_bin=fr_bin,
+                    signed=signed,
+                    high_mask=high_mask,
+                    pos_mask=pos_mask,
+                    neg_mask=neg_mask,
+                    y=np.where(feedback > 0, 1, -1),
+                    use_mask=high_mask & fb_valid,
+                    seed=2,
+                    residual_source="residual",
+                    nuisance_Z=nuisance_Z,
+                )
+                fb_auc_1d_ts[b] = fb_out["auc_1d"]
+                fb_auc_2d_ts[b] = fb_out["auc_2d"]
 
         if do_plots:
             plt.figure(figsize=(7, 4))
@@ -640,7 +789,7 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             plt.axhline(0, color="k", lw=1)
             plt.xlabel("time from stimOn (s)")
             plt.ylabel("summary")
-            plt.title("Time-resolved noise structure")
+            plt.title("Time-resolved noise covariance structure")
             plt.legend(frameon=False)
             plt.tight_layout()
             plt.show()
@@ -654,7 +803,7 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
                 plt.ylim(0.0, 1.0)
                 plt.xlabel("time from stimOn (s)")
                 plt.ylabel("AUC")
-                plt.title("Time-resolved decoding (CV, 1D)")
+                plt.title("Time-resolved decoding (CV, fold-wise axes)")
                 plt.legend(frameon=False)
                 plt.tight_layout()
                 tc = trials["firstMovement_times"] - trials["stimOn_times"]
@@ -669,7 +818,7 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
                 plt.ylim(0.0, 1.0)
                 plt.xlabel("time from stimOn (s)")
                 plt.ylabel("AUC")
-                plt.title("Time-resolved decoding (CV, 1D)")
+                plt.title("Time-resolved decoding (CV, 2D LDA)")
                 plt.legend(frameon=False)
                 plt.tight_layout()
                 tc = trials["firstMovement_times"] - trials["stimOn_times"]
@@ -688,8 +837,17 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             "noise_pr_ts": noise_pr_ts,
             "sig_norm_ts": sig_norm_ts,
             "stim_auc_ts": stim_auc_1d_ts,
+            "stim_auc_2d_ts": stim_auc_2d_ts,
             "choice_auc_ts": choice_auc_1d_ts,
+            "choice_auc_2d_ts": choice_auc_2d_ts,
             "fb_auc_ts": fb_auc_1d_ts,
+            "fb_auc_2d_ts": fb_auc_2d_ts,
+            "n_pos_high": int(pos_mask.sum()),
+            "n_neg_high": int(neg_mask.sum()),
+            "n_choice_valid_high": int((high_mask & choice_valid).sum()),
+            "n_feedback_valid_high": int((high_mask & fb_valid).sum()),
+            "movement_time_median": float(np.nanmedian(t_choice)) if np.isfinite(t_choice).any() else np.nan,
+            "bin_status": bin_status,
         }
 
 def build_eids_from_results(json_path="VISp_subjects_by_lab.json") -> List[str]:
