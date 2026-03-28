@@ -8,7 +8,7 @@ from one.api import ONE
 from brainbox.io.one import SpikeSortingLoader
 from iblatlas.atlas import AllenAtlas as ba
 from brainbox.population.decode import get_spike_counts_in_bins
-
+from sklearn.covariance import LedoitWolf
 from passiveGabor_VIS import load_results
 
 
@@ -23,6 +23,8 @@ class AnalyzerConfig:
     cv_folds: int = 5
     residualize_behavioral_nuisance: bool = True
     verbose: bool = True
+    noise_subspace_k: int = 3
+    noise_subspace_var_threshold: Optional[float] = None
 
 
 class IBLAlignmentBase:
@@ -63,23 +65,118 @@ class IBLAlignmentBase:
             return C
         return C / tr
     
-    def top_eigenvector(self, C, return_eigval=False):
+    def top_eigenvector(self, C, num_vectors=1, return_eigval=False):
         """
-        Compute the top eigenvector of C, 
-        ensuring a consistent sign by looking at the largest absolute component.
+        Return the top `num_vectors` eigenvectors of C in descending-eigenvalue order.
         """
         C = self.enforce_sym(C)
         vals, vecs = np.linalg.eigh(C)
-        idx = int(np.argmax(vals))
-        v = vecs[:, idx]
-        j = int(np.argmax(np.abs(v)))
-        if v[j] < 0:
-            v = -v
-        # normalize for stability (also for cosine)
-        v = v / (np.linalg.norm(v) + self.cfg.eps)
+        order = np.argsort(vals)[::-1]
+
+        num_vectors = int(num_vectors)
+        if num_vectors < 1:
+            raise ValueError(f"num_vectors must be >= 1, got {num_vectors}")
+
+        num_vectors = min(num_vectors, vecs.shape[1])
+        top_idx = order[:num_vectors]
+        top_vals = vals[top_idx]
+        top_vecs = vecs[:, top_idx].copy()
+
+        for i in range(top_vecs.shape[1]):
+            v = top_vecs[:, i]
+            j = int(np.argmax(np.abs(v)))
+            if v[j] < 0:
+                v = -v
+            top_vecs[:, i] = v / (np.linalg.norm(v) + self.cfg.eps)
+
+        if num_vectors == 1:
+            v = top_vecs[:, 0]
+            if return_eigval:
+                return v, float(top_vals[0])
+            return v
+
         if return_eigval:
-            return v, float(vals[idx])
-        return v
+            return top_vecs, top_vals.astype(float)
+        return top_vecs
+
+    def top_noise_subspace(self, C, k=None, var_threshold=None, return_eigvals=False):
+        """
+        Return the top-k noise subspace of C.
+        """
+        C = self.enforce_sym(C)
+        vals, vecs = np.linalg.eigh(C)
+        order = np.argsort(vals)[::-1]
+        vals = np.clip(vals[order], 0.0, None)
+        vecs = vecs[:, order]
+
+        if vecs.shape[1] == 0:
+            raise RuntimeError("Empty covariance matrix.")
+
+        if var_threshold is not None:
+            thr = float(var_threshold)
+            if not (0.0 < thr <= 1.0):
+                raise ValueError(f"var_threshold must be in (0, 1], got {var_threshold}")
+            cum = np.cumsum(vals) / (np.sum(vals) + self.cfg.eps)
+            k_sel = int(np.searchsorted(cum, thr, side="left")) + 1
+        else:
+            if k is None:
+                k = self.cfg.noise_subspace_k
+            k_sel = int(k)
+
+        if k_sel < 1:
+            raise ValueError(f"k must be >= 1, got {k_sel}")
+
+        k_sel = min(k_sel, vecs.shape[1])
+        U_k = vecs[:, :k_sel].copy()
+        evals_k = vals[:k_sel].astype(float)
+
+        for i in range(U_k.shape[1]):
+            v = U_k[:, i]
+            j = int(np.argmax(np.abs(v)))
+            if v[j] < 0:
+                v = -v
+            U_k[:, i] = v / (np.linalg.norm(v) + self.cfg.eps)
+
+        if return_eigvals:
+            return U_k, evals_k
+        return U_k
+
+    def signal_noise_subspace_overlap(self, delta_mu, U_k):
+        """
+        overlap_ratio ~ 1: signal lies mostly in dominant noise subspace
+        overlap_ratio ~ 0: signal is mostly orthogonal to dominant noise subspace
+        """
+        delta_mu = np.asarray(delta_mu, float)
+        U_k = np.asarray(U_k, float)
+        if delta_mu.ndim != 1:
+            raise ValueError(f"delta_mu must be 1D, got {delta_mu.shape}")
+        if U_k.ndim != 2:
+            raise ValueError(f"U_k must be 2D, got {U_k.shape}")
+        if U_k.shape[0] != delta_mu.shape[0]:
+            raise ValueError(
+                f"Shape mismatch: delta_mu has length {delta_mu.shape[0]}, "
+                f"but U_k has shape {U_k.shape}"
+            )
+
+        proj = U_k.T @ delta_mu
+        delta_parallel = U_k @ proj
+        delta_orth = delta_mu - delta_parallel
+        parallel_energy = float(np.sum(delta_parallel ** 2))
+        orth_energy = float(np.sum(delta_orth ** 2))
+        total_energy = float(np.sum(delta_mu ** 2))
+        overlap_ratio = float(parallel_energy / (total_energy + self.cfg.eps))
+        contrib = (proj ** 2) / (total_energy + self.cfg.eps)
+
+        return {
+            "proj": proj,
+            "delta_parallel": delta_parallel,
+            "delta_orth": delta_orth,
+            "parallel_energy": parallel_energy,
+            "orth_energy": orth_energy,
+            "total_energy": total_energy,
+            "overlap_ratio": overlap_ratio,
+            "contrib": contrib,
+        }
 
     @staticmethod
     def cosine_abs(u, v, eps=1e-12):
@@ -258,18 +355,13 @@ class IBLAlignmentBase:
             raise RuntimeError("Too few varying units to compute covariance.")
 
         X = X[:, keep]
-        C = np.cov(X, rowvar=False)
-
-        # just in case any numerical NaNs remain
+        # use Ledoit-Wolf shrinkage for better conditioning
+        lw = LedoitWolf(store_precision=False, assume_centered=True)
+        lw.fit(X)
+        C = lw.covariance_
         C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
-        C = 0.5 * (C + C.T)
+        C = self.enforce_sym(C)
         return C, keep
-
-    def noise_corr_from_residuals(self, fr_noise, high_mask):
-        """
-        Backward-compatible alias for callers that still expect the old name.
-        """
-        return self.noise_cov_from_residuals(fr_noise, high_mask)
 
     @staticmethod
     def stratified_kfold_indices(y, k=5, seed=0):
@@ -482,7 +574,7 @@ class StaticAlignmentAnalyzer(IBLAlignmentBase):
     - Bin spikes over stimOn->stimOff (one value per trial)
     - Build u_sig using mu_pos-mu_neg on high-contrast trials
     - Build noise corr from residuals
-    - Compute alignment cosine + noise spectrum summaries
+    - Compute signal overlap with dominant noise subspace + noise spectrum summaries
     """
 
     def load_trial_firing_rates(self, eid: str):
@@ -527,12 +619,18 @@ class StaticAlignmentAnalyzer(IBLAlignmentBase):
         C_noi, keep_bin = self.noise_cov_from_residuals(fr_noise, high_mask)
         if keep_bin.sum() < self.cfg.min_units:
             raise RuntimeError("Too few varying units for noise covariance in this session.")
-        u_sig_k = u_sig[keep_bin]
-        
-        u_sig_k = u_sig_k / (np.linalg.norm(u_sig_k) + self.cfg.eps)
+        delta_mu_k = mu_pos[keep_bin] - mu_neg[keep_bin]
+        u_sig_k = delta_mu_k / (np.linalg.norm(delta_mu_k) + self.cfg.eps)
 
         C_noi_norm = self.trace_normalize(C_noi)
         u_noi_k, ev_noi = self.top_eigenvector(C_noi_norm, return_eigval=True)
+        U_noi, evals_k = self.top_noise_subspace(
+            C_noi_norm,
+            k=self.cfg.noise_subspace_k,
+            var_threshold=self.cfg.noise_subspace_var_threshold,
+            return_eigvals=True,
+        )
+        overlap_out = self.signal_noise_subspace_overlap(delta_mu_k, U_noi)
 
         cos = self.cosine_abs(u_sig_k, u_noi_k)
 
@@ -561,11 +659,18 @@ class StaticAlignmentAnalyzer(IBLAlignmentBase):
             "T": int(fr.shape[0]),
             "N": int(fr.shape[1]),
             "sig_norm": float(sig_norm),
+            "noise_subspace_overlap": float(overlap_out["overlap_ratio"]),
+            "noise_subspace_proj": overlap_out["proj"],
+            "noise_subspace_contrib": overlap_out["contrib"],
+            "noise_subspace_parallel_energy": float(overlap_out["parallel_energy"]),
+            "noise_subspace_orth_energy": float(overlap_out["orth_energy"]),
+            "noise_subspace_dim": int(U_noi.shape[1]),
             "cosine": float(cos),
             "noise_top1": float(vals[0]) if len(vals) else np.nan,
             "noise_top5_cum": float(cum[min(4, len(cum)-1)]) if len(cum) else np.nan,
             "noise_PR": float(D_eff),
             "noise_top_eig": float(ev_noi),
+            "noise_subspace_eigvals": evals_k,
             "n_pos_high": int(pos_mask.sum()),
             "n_neg_high": int(neg_mask.sum()),
             "n_units_cov": int(keep_bin.sum()),
@@ -585,7 +690,7 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
     """
     Equivalent of your time_resolved_alignment.py:
     - Build fr_tb: (n_trials, n_bins, n_units)
-    - For each bin, compute u_sig(t), noise covariance, u_noi(t), alignment(t)
+    - For each bin, compute u_sig(t), noise covariance, dominant noise subspace, alignment(t)
     - Optionally run 1D decoding timecourses
     """
 
@@ -677,9 +782,13 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
 
         times = 0.5 * (edges[:-1] + edges[1:])
         cos_ts = np.full(n_bins, np.nan)
+        noise_subspace_overlap_ts = np.full(n_bins, np.nan)
         noise_top1_ts = np.full(n_bins, np.nan)
         noise_pr_ts = np.full(n_bins, np.nan)
         sig_norm_ts = np.full(n_bins, np.nan)
+        noise_subspace_dim_ts = np.full(n_bins, np.nan)
+        noise_subspace_proj_ts: List[np.ndarray] = [np.array([], dtype=float) for _ in range(n_bins)]
+        noise_subspace_contrib_ts: List[np.ndarray] = [np.array([], dtype=float) for _ in range(n_bins)]
         
         stim_auc_1d_ts = np.full(n_bins, np.nan)
         stim_auc_2d_ts = np.full(n_bins, np.nan)
@@ -709,20 +818,36 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
 
             try:
                 C_noi, keep_bin = self.noise_cov_from_residuals(fr_noise, high_mask)
-
-                usig_k = u_sig[keep_bin]
-                usig_k = usig_k / (np.linalg.norm(usig_k) + self.cfg.eps)
-
-                unoi_k, _ = self.top_eigenvector(self.trace_normalize(C_noi), return_eigval=True)
+                delta_mu_k = mu_pos[keep_bin] - mu_neg[keep_bin]
+                usig_k = delta_mu_k / (np.linalg.norm(delta_mu_k) + self.cfg.eps)
+                C_noi_norm = self.trace_normalize(C_noi)
+                unoi_k, _ = self.top_eigenvector(C_noi_norm, return_eigval=True)
+                U_noi = self.top_noise_subspace(
+                    C_noi_norm,
+                    k=self.cfg.noise_subspace_k,
+                    var_threshold=self.cfg.noise_subspace_var_threshold,
+                    return_eigvals=False,
+                )
+                overlap_out = self.signal_noise_subspace_overlap(delta_mu_k, U_noi)
             except Exception as exc:
                 bin_status.append({"bin": int(b), "status": "noise_failed", "reason": repr(exc)})
                 continue
 
             cos_ts[b] = self.cosine_abs(usig_k, unoi_k, eps=self.cfg.eps)
+            noise_subspace_overlap_ts[b] = overlap_out["overlap_ratio"]
+            noise_subspace_dim_ts[b] = U_noi.shape[1]
+            noise_subspace_proj_ts[b] = overlap_out["proj"]
+            noise_subspace_contrib_ts[b] = overlap_out["contrib"]
             vals, _ = self.eig_spectrum(C_noi, do_trace_norm=True)
             noise_top1_ts[b] = float(vals[0]) if len(vals) else np.nan
             noise_pr_ts[b] = self.participation_ratio(vals)
-            bin_status.append({"bin": int(b), "status": "ok", "n_units_cov": int(keep_bin.sum())})
+            bin_status.append({
+                "bin": int(b),
+                "status": "ok",
+                "n_units_cov": int(keep_bin.sum()),
+                "noise_subspace_overlap": float(overlap_out["overlap_ratio"]),
+                "noise_subspace_dim": int(U_noi.shape[1]),
+            })
 
             if self.do_decode:
                 stim_out = self.decode_bin_foldwise(
@@ -772,12 +897,14 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
 
         if do_plots:
             plt.figure(figsize=(7, 4))
-            plt.plot(times, cos_ts, marker="o")
+            plt.plot(times, noise_subspace_overlap_ts, marker="o", label="subspace overlap")
+            plt.plot(times, cos_ts, marker="o", label="top-1 cosine")
             plt.ylim(0, 1.05)
             plt.axhline(0, color="k", lw=1)
             plt.xlabel("time from stimOn (s)")
-            plt.ylabel("|cos(u_sig(t), u_noi(t))|")
+            plt.ylabel("alignment")
             plt.title("Time-resolved signal-noise alignment")
+            plt.legend(frameon=False)
             plt.tight_layout()
             plt.show()
 
@@ -832,6 +959,10 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             "n_trials": int(n_trials),
             "n_units": int(n_units),
             "times": times,
+            "noise_subspace_overlap_ts": noise_subspace_overlap_ts,
+            "noise_subspace_proj_ts": noise_subspace_proj_ts,
+            "noise_subspace_contrib_ts": noise_subspace_contrib_ts,
+            "noise_subspace_dim_ts": noise_subspace_dim_ts,
             "cos_ts": cos_ts,
             "noise_top1_ts": noise_top1_ts,
             "noise_pr_ts": noise_pr_ts,
