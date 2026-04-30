@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+import stability_analysis as sa
 
 from one.api import ONE
 from brainbox.io.one import SpikeSortingLoader
@@ -10,7 +12,6 @@ from iblatlas.atlas import AllenAtlas as ba
 from brainbox.population.decode import get_spike_counts_in_bins
 from sklearn.covariance import LedoitWolf
 from passiveGabor_VIS import load_results
-
 
 @dataclass
 class AnalyzerConfig:
@@ -802,7 +803,8 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
         choice_valid = choice != 0
         fb_valid = feedback != 0
         bin_status = []
-
+        signal_reliability_ts = np.full(n_bins, np.nan)
+        decoder_reliability_ts = np.full(n_bins, np.nan)
         for b in range(n_bins):
             fr_bin = fr_tb[:, b, :]  # (trial, unit)
 
@@ -894,8 +896,17 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
                 )
                 fb_auc_1d_ts[b] = fb_out["auc_1d"]
                 fb_auc_2d_ts[b] = fb_out["auc_2d"]
+       
+                sig_reliability = sa.split_half_signal_reliability(self, fr_bin, pos_mask, neg_mask)
+                decoder_reliability = sa.split_half_decoder_reliability(self, pos_mask, neg_mask, fr_bin)
+
+                signal_reliability_ts[b] = sig_reliability['cosine_similarity_u_sig']
+                decoder_reliability_ts[b] = decoder_reliability['cosine_similarity_decoder']
+
 
         if do_plots:
+            import os
+            os.makedirs("plots", exist_ok=True)
             plt.figure(figsize=(7, 4))
             plt.plot(times, noise_subspace_overlap_ts, marker="o", label="subspace overlap")
             plt.plot(times, cos_ts, marker="o", label="top-1 cosine")
@@ -906,7 +917,9 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             plt.title("Time-resolved signal-noise alignment")
             plt.legend(frameon=False)
             plt.tight_layout()
-            plt.show()
+            plt.legend(frameon=False)
+            plt.savefig(f"plots/{eid}_alignment_ts.png", dpi=300, bbox_inches="tight")
+            plt.close()
 
             plt.figure(figsize=(7, 4))
             plt.plot(times, noise_top1_ts, marker="o", label="noise top-1 (trace-norm)")
@@ -919,7 +932,8 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             plt.title("Time-resolved noise covariance structure")
             plt.legend(frameon=False)
             plt.tight_layout()
-            plt.show()
+            plt.savefig(f"plots/{eid}_noise_structure_ts.png", dpi=300, bbox_inches="tight")
+            plt.close()
 
             if self.do_decode:
                 plt.figure(figsize=(7, 4))
@@ -936,7 +950,9 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
                 tc = trials["firstMovement_times"] - trials["stimOn_times"]
                 tc = tc[np.isfinite(tc)]
                 plt.axvline(np.median(tc), linestyle="--")
-                plt.show()
+                plt.savefig(f"plots/{eid}_decode_1d_ts.png", dpi=300, bbox_inches="tight")
+                plt.close()
+
                 plt.figure(figsize=(7, 4))
                 plt.plot(times, stim_auc_2d_ts, marker="o", label="stimulus AUC (proj)")
                 plt.plot(times, choice_auc_2d_ts, marker="o", label="choice AUC (proj)")
@@ -951,7 +967,27 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
                 tc = trials["firstMovement_times"] - trials["stimOn_times"]
                 tc = tc[np.isfinite(tc)]
                 plt.axvline(np.median(tc), linestyle="--")
-                plt.show()
+                plt.savefig(f"plots/{eid}_decode_2d_ts.png", dpi=300, bbox_inches="tight")
+                plt.close()
+
+                plt.figure(figsize=(7, 4))
+                plt.plot(times, stim_auc_2d_ts, marker="o", label="stimulus AUC (2D)")
+                plt.plot(times, choice_auc_2d_ts, marker="o", label="choice AUC (2D)")
+                plt.plot(times, fb_auc_2d_ts, marker="o", label="feedback AUC (2D)")
+                plt.plot(times, decoder_reliability_ts, marker="o", linestyle="--", label="decoder reliability")
+                plt.plot(times, signal_reliability_ts, marker="o", linestyle="--", label="signal reliability")
+                plt.axhline(0.5, color="k", lw=1)
+                plt.ylim(0.0, 1.0)
+                plt.xlabel("time from stimOn (s)")
+                plt.ylabel("AUC / reliability")
+                plt.title("Decoding + reliability")
+                plt.legend(frameon=False)
+                plt.tight_layout()
+                tc = trials["firstMovement_times"] - trials["stimOn_times"]
+                tc = tc[np.isfinite(tc)]
+                plt.axvline(np.median(tc), linestyle="--")
+                plt.savefig(f"plots/{eid}_decode_2d_reliability.png", dpi=300, bbox_inches="tight")
+                plt.close()
 
         return {
             "eid": eid,
@@ -979,6 +1015,8 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             "n_feedback_valid_high": int((high_mask & fb_valid).sum()),
             "movement_time_median": float(np.nanmedian(t_choice)) if np.isfinite(t_choice).any() else np.nan,
             "bin_status": bin_status,
+            "signal_reliability_ts": signal_reliability_ts,
+            "decoder_reliability_ts": decoder_reliability_ts,
         }
 
 def build_eids_from_results(json_path="VISp_subjects_by_lab.json") -> List[str]:
@@ -999,8 +1037,11 @@ def print_feedback_summary(trials):
         print(f"  value {v:>2}: {(feedback == v).sum()} trials")
 
 if __name__ == "__main__":
-    ONE.setup(base_url="https://openalyx.internationalbrainlab.org", silent=True)
-    one = ONE(password="international")
+
+    ONE.setup(silent=True)  
+    one = ONE(
+    base_url='https://openalyx.internationalbrainlab.org',
+    cache_dir='/scratch/midway3/xiaorantu/ONE')
     atlas = ba()
 
     eids = build_eids_from_results("VISp_subjects_by_lab.json")
