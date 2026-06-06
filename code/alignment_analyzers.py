@@ -826,6 +826,9 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
         cos_w_sig = np.full(n_bins, np.nan)
         cos_w_noi = np.full(n_bins, np.nan)
 
+        signal_weight_frac_ts = np.full(n_bins, np.nan)
+        noise_weight_frac_ts = np.full(n_bins, np.nan)
+
         for b in range(n_bins):
             fr_bin = fr_tb[:, b, :]  # (trial, unit)
 
@@ -887,7 +890,9 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
                 )
                 stim_auc_1d_ts[b] = stim_out["auc_1d"]
                 stim_auc_2d_ts[b] = stim_out["auc_2d"]
-                w = stim_out["w_mean"]
+                w = np.asarray(stim_out["w_mean"], float)
+                signal_weight_frac_ts[b] = abs(w[0]) / np.linalg.norm(w)
+                noise_weight_frac_ts[b] = np.linalg.norm(w[1:]) / np.linalg.norm(w)
 
                 cos_w_sig[b] = abs(w[0])
                 cos_w_noi[b] = abs(w[1])
@@ -1070,6 +1075,8 @@ class TimeResolvedAlignmentAnalyzer(IBLAlignmentBase):
             "bin_status": bin_status,
             "signal_reliability_ts": signal_reliability_ts,
             "decoder_reliability_ts": decoder_reliability_ts,
+            "signal_weight_frac_ts": signal_weight_frac_ts,
+            "noise_weight_frac_ts": noise_weight_frac_ts,
         }
 
 def build_eids_from_results(json_path="VISp_subjects_by_lab.json") -> List[str]:
@@ -1126,7 +1133,7 @@ if __name__ == "__main__":
 
     # for testing: only use first 5 eids
 
-    eids_to_run = eids[5:15]
+    eids_to_run = eids[:25]
 
     eid = eids_to_run[task_id]
 

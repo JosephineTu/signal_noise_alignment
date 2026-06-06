@@ -1,0 +1,9 @@
+.vscode-server/
+ONE/
+__pycache__/
+*.pkl
+*.npy
+*.npz
+*.parquet
+*.feather
+*.csv

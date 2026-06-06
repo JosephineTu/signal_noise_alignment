@@ -33,3 +33,33 @@ def angle_between(a, b):
     c = cosine_similarity(a, b)
     c = np.clip(c, -1.0, 1.0)
     return np.arccos(c)
+
+
+def eigenvectors_above_threshold(C, threshold, return_eigvals=False):
+
+    eps = 1e-12
+
+    C = np.asarray(C, dtype=float)
+    C = (C + C.T) / 2  # enforce symmetry
+
+    vals, vecs = eigh(C)  # ascending order
+    idx = np.where(vals >= threshold)[0]
+
+    if len(idx) == 0:
+        raise ValueError("No eigenvalues above threshold.")
+
+    V = vecs[:, idx]
+
+    # sign normalization + unit norm
+    for k in range(V.shape[1]):
+        v = V[:, k]
+        if np.abs(v).max() > eps and v[np.argmax(np.abs(v))] < 0:
+            V[:, k] = -v
+        V[:, k] /= np.linalg.norm(V[:, k])
+
+    if return_eigvals:
+        return V, vals[idx]
+    else:
+        return V
+def participation_ratio(eigenvalues):
+    return (np.sum(eigenvalues) ** 2) / np.sum(eigenvalues ** 2)
